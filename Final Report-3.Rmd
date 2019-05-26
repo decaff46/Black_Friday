@@ -1,0 +1,937 @@
+---
+title: "Final Report_Black Friday"
+author: "Brad Kim, Casey O’Malley,  Qi Ding, Caffrey Lee,  Zoe Huang"
+date: ""
+output:
+  prettydoc::html_pretty:
+    theme: cayman
+    highlight: github
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+set.seed(123) # ensures repeatable results for attribution rules
+options(scipen=999) # suppress scientific notation
+```
+
+```{r include=FALSE}
+data = read.csv("../Data/BlackFriday.csv")
+```
+
+```{r Library Setups, include=FALSE}
+library(tidyverse)
+library(scales)
+library(arules)
+library(DT)
+library(ggplot2)
+library(gridExtra)
+library(data.table)
+library(cluster)
+library(purrr)
+library(caret)
+library(dplyr)
+library(psych)
+library(RColorBrewer)
+library(recommenderlab)
+library(tidyr)
+library(tibble)
+library(ggthemes)
+library(prettydoc)
+```
+
+```{r functions, include=FALSE}
+round.numerics <- function(x, digits){
+  if(is.numeric(x)){
+    x <- round(x = x, digits = digits)
+  }
+  return(x)
+}
+
+stat_function = function(x){
+    if(class(x)=="integer"|class(x)=="numeric"){
+        var_type = class(x)
+        length = length(x)
+        miss_val = sum(is.na(x))
+        mean = mean(x,na.rm = T)
+        std = sd(x,na.rm = T)
+        var = var(x,na.rm = T)
+        cv = std/mean
+        min = min(x)
+        max = max(x,na.rm = T)
+        pct = quantile(x,na.rm = T,p=c(0.75,0.85,0.90,0.95,0.99,1.0))
+        return(c(var_type=var_type,length=length,miss_val=miss_val,mean=mean,std=std,var=var,cv=cv,min=min,max=max,pct=pct))
+        }
+}
+```
+
+#Part1: Pre-process
+
+Let's take a **quick overview** of the entire dataset
+
+```{r overview}
+summary(data)
+str(data)
+head(data)
+```
+**There are 12 different columns**: each represents a corresponding variable below :
+
+    - User_ID: Unique identifier of shopper.
+    - Product_ID: Unique identifier of product. (No key given)
+    - Gender: Sex of shopper.
+    - Age: Age of shopper split into bins.
+    - Occupation: Occupation of shopper. (No key given)
+    - City_Category: Residence location of shopper. (No key given)
+    - Stay_In_Current_City_Years: Number of years stay in current city.
+    - Marital_Status: Marital status of shopper. 0 is corresponds to the non-marriage people, 1 is corresponds to the marriage people.
+    - Product_Category_1: Product category of purchase.
+    - Product_Category_2: Product may belong to other category.
+    - Product_Category_3: Product may belong to other category.
+    - Purchase: Purchase amount in dollars.
+
+**Change data type of variable**: Convert some of the features to factors (some ordinal and others nominal), for affinity analysis
+
+```{r data_type}
+data$User_ID <- as.factor(data$User_ID)
+data$Product_ID <- as.factor(data$Product_ID)
+data$Gender <- as.factor(data$Gender)
+data$Age <- ordered(data$Age, labels = c("0-17", "18-25", "26-35", "36-45", "46-50", "51-55", "55+"))
+data$Occupation <- as.factor(data$Occupation)
+data$City_Category <- ordered(data$City_Category)
+data$Stay_In_Current_City_Years <- ordered(data$Stay_In_Current_City_Years)
+data$Marital_Status <- as.factor(data$Marital_Status)
+
+data$Product_Category_1 <- as.factor(data$Product_Category_1)
+data$Product_Category_2 <- as.factor(data$Product_Category_2)
+data$Product_Category_3 <- as.factor(data$Product_Category_3)
+```
+
+**Check missing value**
+
+```{r missing_value}
+num_var = names(data)[sapply(data,is.numeric)]
+cat_var = names(data)[!sapply(data,is.numeric)]
+mystat = apply(data[num_var],2,stat_function)
+t(mystat)
+```
+
+There are NA values for Product_Category_2 and Product_Category_3. NA for these two variables is likely to represent that the concerned person did not buy the products from these categories, so we decided to replace NA with zero.
+
+```{r replace_NA}
+data[is.na(data)] = 0
+```
+
+Up to this point, we finished cleaning data procedure and already got the clean data for furture analysis. Below is the code that we will use in our next step for different analysis. **data** is now a cleaned dataset the same as the dataset we submitted in our project deliverable 1 named **cleaned_data**
+
+#Part2 Explorative Data Analysis
+
+### Part2-1: Overall analysis about customers
+
+We divided our Explorative Data Analysis into two parts: First let's explore the overall description about customers.
+
+**How many unique customers are in the data**
+
+```{r unique_customers}
+data %>%
+  select(User_ID) %>%
+  distinct() %>%
+  summarise(`Unique Customer(s)` = n())
+```
+
+There are 5891 Unique Customers are sitting in the Black Friday data. In other words, many customers have multiple transactions for different items. 
+
+**Count the number of transactions of each customer**
+
+```{r #_of_transaction}
+customers_transaction = data %>%
+                          group_by(User_ID) %>%
+                          count(User_ID)
+setorderv(customers_transaction,"n",-1)
+customers_transaction
+```
+
+It looks like User_ID 1001680 shows up the most on our master ledger of shopper data. Since each individual row represents a different transaction, this user made **over 1000** total transactions! 
+
+**Calculate the total spending of each customer**
+
+Now let's do some investigation regarding store customers and their purchases. We will start by computing the total purchase amount by user ID
+
+```{r $_of_spending}
+customers_total_purchase_amount = data %>%
+                                    group_by(User_ID) %>%
+                                    summarise(Purchase_Amount = sum(Purchase))
+setorderv(customers_total_purchase_amount,"Purchase_Amount",-1)
+customers_total_purchase_amount
+```
+
+It looks like User_ID 1004277 spends the most on our master ledger of shopper data. This user spent *over $10536783* in total transactions during Black Friday! 
+
+We can join together these two tables above - the number of transactions of each customer dataset with our total customer purchases dataset - to see them combined.
+
+```{r combined_#_and_$}
+total_shoppers =  customers_transaction %>%
+                    select(User_ID, n) %>%
+                    left_join(customers_total_purchase_amount, Purchase_Amount, by = 'User_ID')
+
+head(total_shoppers)
+```
+
+Now that we have joined these two tables together, we can see that although *User_ID 1001680* has the highest number of total transactions, *User_ID 1004277* has the highest Purchase_Amount as identified in our earlier analysis as well. From here, we can also compute the average Purchase_Amount for each user.
+
+**Compute the average Purchase_Amout of each customer**
+
+```{r average_purchase_amount}
+total_shoppers = mutate(total_shoppers,
+                  Average_Purchase_Amount = Purchase_Amount/n)
+setorderv(total_shoppers,"Average_Purchase_Amount", -1)
+head(total_shoppers)
+```
+
+It looks like that *User_ID 1005069* has the highest Average_Purchase_Amount and a total Purchase_Amount of 308454. *User_ID 1003902* is right behind *User_ID 1005069* in Average_Purchase_Amount, but has a much higher total Purchase_Amount of 1746284.
+
+### Part2-2: Detailed analysis about customers based on each variable
+
+After taking a look at the overall description about customers, we will analyze sales by demographic analysis of customers eg city, age, gender, and such. The goal of this process is to give more information about our data so that the marketing team prepares to intensify the efficiency based on the data and information we will provide. Since there are several features provided:
+
+1. We found many interesting facts about customer-behaviour during Black friday as follows;
+
+2. Besides the analysis below, we also created a separate shiny reporting engine so that user can compare the result of each variable more easily.
+
+### Gender
+
+To begin our exploration, let's examine the gender of shoppers at this store.
+
+Since each row represents an individual transaction, we must first group the data by User_ID to remove duplicates.
+
+```{r Gender Population}
+gender_data = data %>%
+  select(User_ID, Gender) %>%
+  group_by(Gender) %>%
+  distinct() %>%
+  summarize(Count = n())
+```
+
+Now that we have the data table necessary to see each User_IDs corresponding gender and their total counts for reference, let's plot the distribution of gender across our dataset and take a look at their purchasing record.
+
+```{r visualized_gender}
+# Visualize the Gender population
+barplot(height = gender_data$Count, space=0.01, las = 1, main = "Gender population of Black Friday customers", ylab = "number of customers", xlab = "Gender", ylim = c(0, 1.2*max(gender_data$Count, na.rm = TRUE)), col = "dodgerblue", names.arg = gender_data$Gender)
+
+space_val = 0
+text(x = -0.4 + 1:length(gender_data$Gender) * (1+space_val), y = gender_data$Count, labels = gender_data$Count, pos = 3)             
+```
+
+**The total number of transactions of each person**
+
+```{r Gender transaction}
+gender_transaction = data %>%
+  select(User_ID, Gender) %>%
+  group_by(Gender) %>%
+  summarize(Count = n())
+
+# Visualize the Gender transaction
+barplot(height = gender_transaction$Count, space=0.01, las = 1, main = "Gender transactions of Black Friday customers", xlab = "Gender", ylim = c(0, 1.2*max(gender_transaction$Count, na.rm = TRUE)), col = "dodgerblue", names.arg  = gender_transaction$Gender)
+
+space_val = 0
+text(x = -0.4 + 1:length(gender_transaction$Gender) * (1+space_val), y = gender_transaction$Count, labels = gender_transaction$Count, pos = 3)             
+```
+
+**The total spending of each person**
+
+```{r Gender Spending per person}
+avg_gender_spending_per_person = data %>%
+  select(User_ID, Gender, Purchase) %>%
+  group_by(Gender) %>%
+  summarize(Total_purchase = sum(as.numeric(Purchase))) %>%
+  full_join(gender_data, by = "Gender") %>%
+  group_by(Gender) %>%
+  summarize(Average = Total_purchase/Count)
+
+# Visualize the avg_gender_spending_per_person
+barplot(height = avg_gender_spending_per_person$Average, space=0.01, las = 1, main = "Average purchase amount by gender per person($)", xlab = "Gender", ylim = c(0, 1.2*max(avg_gender_spending_per_person$Average, na.rm = TRUE)), col = "dodgerblue", names.arg  = avg_gender_spending_per_person$Gender)
+
+space_val = 0
+text(x = -0.4 + 1:length(avg_gender_spending_per_person$Gender) * (1+space_val), y = avg_gender_spending_per_person$Average, labels = round(avg_gender_spending_per_person$Average,2), pos = 3) 
+```
+
+**Interesting fact 1**: As we can see, there are quite a few more males than females shopping at our store on Black Friday. But it could also mean less number of females paid for the products and may be their spouse paid for them. 
+
+This gender split metric is helpful to retailers because some might want to modify their store layout, product selection, and other variables differently depending on the gender proportion of their shoppers, which displays a difference in the value derived from shopping and its relationship to gender.
+
+```{r Top Item}
+top_item = data %>%
+  count(Product_ID, sort = T)
+
+top_5 = top_item[1:5,]
+datatable(top_5)
+```
+
+Top 5 items : P00265242, P00110742, P00025442, P00112142, P00057642
+Now, we track down by Gender.
+
+```{r Top_Item by Gender per transaction}
+data[data$Product_ID %in% top_5$Product_ID,] %>%
+  select(User_ID, Product_ID, Gender, Purchase) %>%
+  group_by(Product_ID, Gender) %>%
+  summarize(Total_purchase = sum(as.numeric(Purchase)),
+            Count = n()) %>%
+  mutate(Average = Total_purchase/Count)
+```
+
+**Interesting Fact 2**: even though people are purchasing the same product, they are paying different prices. Clearly, Females are paying less than male shoppers for all Top5 items. This could be explained by varied Black Friday promotions, discounts, or coupon codes. 
+
+```{r Gender population in Top_item vs Gender population in Overall Items}
+gender_transaction_Top_item = data[data$Product_ID %in% top_5$Product_ID,] %>%
+  select(User_ID, Gender) %>%
+  group_by(Gender) %>%
+  summarize(Count = n())
+
+# Visualize the Gender transaction for top items only
+pie(gender_transaction_Top_item$Count, labels = paste(paste(gender_transaction_Top_item$Gender,round(gender_transaction_Top_item$Count/sum(gender_transaction_Top_item$Count)*100,2)),"%",sep = ""), main="% of transactions in each gender for top items only")
+
+# Visualize the overall Gender transaction
+pie(gender_transaction$Count, labels = paste(paste(gender_transaction$Gender,round(gender_transaction$Count/sum(gender_transaction$Count)*100,2)),"%",sep = ""), main="% of transactions in each gender for all items")
+```
+
+We can see that within the overall observation set, both purchasers of the best seller and purchasers of all products are roughly ~25% female and ~75% male. A slight difference does exist but it seems like we can generally conclude that our best seller does not cater to a specific gender.
+
+### AGE
+
+Now, let's examine the age of shoppers at this store.
+
+```{r Age Population}
+age_data = data %>%
+  select(User_ID, Age) %>%
+  group_by(Age) %>%
+  distinct() %>%
+  summarize(Count = n())
+```
+
+```{r visualized_age}
+# Visualize the Age population
+barplot(height = age_data$Count, space=0.01, las = 1, main = "Age population of Black Friday customers", ylab = "number of customers", xlab = "Age", ylim = c(0, 1.2*max(age_data$Count, na.rm = TRUE)), col = "dodgerblue", names.arg = age_data$Age)
+
+space_val = 0
+text(x = -0.4 + 1:length(age_data$Age) * (1+space_val), y = age_data$Count, labels = age_data$Count, pos = 3)             
+```
+
+**Interesting fact 3**: On plotting a count plot for age, seems like the majority of the population in the age group 26-35 attended the sale，which means people age of between 26-35 tend to buy more products and spend more money. Usually in that age, people's financial status is better than younger. Also they are interested in technology and promotions more than older people.
+
+**The total number of transactions of each person**
+
+```{r Age transaction}
+age_transaction = data %>%
+  select(User_ID, Age) %>%
+  group_by(Age) %>%
+  summarize(Count = n())
+
+# Visualize the Age transaction
+barplot(height = age_transaction$Count, space=0.01, las = 1, main = "Age transactions of Black Friday customers", xlab = "Age", ylim = c(0, 1.2*max(age_transaction$Count, na.rm = TRUE)), col = "dodgerblue", names.arg  = age_transaction$Age)
+
+space_val = 0
+text(x = -0.4 + 1:length(age_transaction$Age) * (1+space_val), y = age_transaction$Count, labels = age_transaction$Count, pos = 3)             
+```
+
+It's quite apparent that the largest age group amongst the customers is 26-35, in terms of either number of customers or number of transactions. But does this mean that the amount of money spent amongst the age groups is different significantly? Let's see...
+
+**The total spending of each person**
+
+```{r Age Spending per person}
+avg_age_spending_per_person = data %>%
+  select(User_ID, Age, Purchase) %>%
+  group_by(Age) %>%
+  summarize(Total_purchase = sum(as.numeric(Purchase))) %>%
+  full_join(age_data, by = "Age") %>%
+  group_by(Age) %>%
+  summarize(Average = Total_purchase/Count)
+
+# Visualize the avg_age_spending_per_person
+barplot(height = avg_age_spending_per_person$Average, space=0.01, las = 1, main = "Average purchase amount by age per person($)", xlab = "Age", ylim = c(0, 1.2*max(avg_age_spending_per_person$Average, na.rm = TRUE)), col = "dodgerblue", names.arg  = avg_age_spending_per_person$Age)
+
+space_val = 0
+text(x = -0.4 + 1:length(avg_age_spending_per_person$Age) * (1+space_val), y = avg_age_spending_per_person$Average, labels = round(avg_age_spending_per_person$Average,2), pos = 3) 
+```
+
+**Interesting fact 4**: It seems that this particular brand is loved by young and mid people (18-25, 26-35, and 36-45). Obviously, we can consider that the target age group of our stores is the age group of 26-35 years, we have achieved sales of more than 3 billion in the age group of 26-45 years.
+
+**The average spending amount of each transaction**
+
+```{r Age Spending per transaction}
+avg_age_spending_per_transaction = data %>%
+  select(User_ID, Age, Purchase) %>%
+  group_by(Age) %>%
+  summarize(Total_purchase = sum(as.numeric(Purchase)),
+            Count = n(),
+            Average = Total_purchase/Count)
+
+# Visualize the avg_age_spending_per_transaction
+barplot(height = avg_age_spending_per_transaction$Average, space=0.01, las = 1, main = "Average purchase amount by age per transaction($)", xlab = "Age", ylim = c(0, 1.2*max(avg_age_spending_per_transaction$Average, na.rm = TRUE)), col = "dodgerblue",names.arg  = avg_age_spending_per_transaction$Age)
+
+space_val = 0
+text(x = -0.4 + 1:length(avg_age_spending_per_transaction$Age) * (1+space_val), y = avg_age_spending_per_transaction$Average, labels = round(avg_age_spending_per_transaction$Average,2), pos = 3) 
+```
+
+Our data clearly shows that the amount of money made from each age group correlates proportionally with the number of customers within the age groups. However, when it comes to the average spending amount of each transaction, the difference is not that obvious. This can be valuable information for the store, as it might want to add more products geared towards this age group in the future, or perhaps work on marketing different items to increase a broader diversity in the age groups of their customers.
+
+Now, we track down the top 5 products by Age.
+
+```{r Top_Item by Age per transaction}
+data[data$Product_ID %in% top_5$Product_ID,] %>%
+  select(User_ID, Product_ID, Age, Purchase) %>%
+  group_by(Product_ID, Age) %>%
+  summarize(Total_purchase = sum(as.numeric(Purchase)),
+            Count = n()) %>%
+  mutate(Average = Total_purchase/Count)
+```
+
+**Interesting fact 5**: The trend that each group pays for different price for same products happens in Age group as well. But, it is not as significant as it is in Gender. Still, what's interesting is that an age group who pays the least for a specific product now pays the most for another products. This could be also explained by varied Black Friday discounts, or coupon codes; yet, precisely, this could be caused by promotion such as targeting customer marketing strategy. 
+
+### CITY_CATEGORY
+
+Next, Let's see how each city purchased on blackfriday.
+
+Firstly, we must group the data by User_ID to remove duplicates.
+
+```{r City_Category Population}
+City_Category_data = data %>%
+  select(User_ID, City_Category) %>%
+  group_by(City_Category) %>%
+  distinct() %>%
+  summarize(Count = n())
+```
+
+```{r visualized_City_Category}
+# Visualize the City_Category population
+barplot(height = City_Category_data$Count, space=0.01, las = 1, main = "City_Category population of Black Friday customers", ylab = "number of customers", xlab = "City_Category", ylim = c(0, 1.2*max(City_Category_data$Count, na.rm = TRUE)), col = "dodgerblue", names.arg = City_Category_data$City_Category)
+
+space_val = 0
+text(x = -0.4 + 1:length(City_Category_data$City_Category) * (1+space_val), y = City_Category_data$Count, labels = City_Category_data$Count, pos = 3)             
+```
+
+It is obvious that City category C has heights no. of users followed by B, followed by A.
+
+**The total spending of each person**
+
+```{r City_Category Spending per person}
+avg_City_Category_spending_per_person = data %>%
+  select(User_ID, City_Category, Purchase) %>%
+  group_by(City_Category) %>%
+  summarize(Total_purchase = sum(as.numeric(Purchase))) %>%
+  full_join(City_Category_data, by = "City_Category") %>%
+  group_by(City_Category) %>%
+  summarize(Average = Total_purchase/Count)
+
+# Visualize the avg_City_Category_spending_per_person
+barplot(height = avg_City_Category_spending_per_person$Average, space=0.01, las = 1, main = "Average purchase amount by age per person($)", xlab = "City_Category", ylim = c(0, 1.2*max(avg_City_Category_spending_per_person$Average, na.rm = TRUE)), col = "dodgerblue", names.arg  = avg_City_Category_spending_per_person$City_Category)
+
+space_val = 0
+text(x = -0.4 + 1:length(avg_City_Category_spending_per_person$City_Category) * (1+space_val), y = avg_City_Category_spending_per_person$Average, labels = round(avg_City_Category_spending_per_person$Average,2), pos = 3) 
+```
+
+**Interesting fact 6**: Unexpectedly, Purchasing power is not directly related to the amount of purchases for each customer. It is clear that City A has the least number of customers; however, their purchasing power per customer is the highest. People from Area A and B have a greater purchasing power than others, and greater sales gained from people from Area C
+
+**The average spending amount of each transaction**
+
+```{r City_Category Spending per transaction}
+avg_City_Category_spending_per_transaction = data %>%
+  select(User_ID, City_Category, Purchase) %>%
+  group_by(City_Category) %>%
+  summarize(Total_purchase = sum(as.numeric(Purchase)),
+            Count = n(),
+            Average = Total_purchase/Count)
+
+# Visualize the avg_City_Category_spending_per_transaction
+barplot(height = avg_City_Category_spending_per_transaction$Average, space=0.01, las = 1, main = "Average purchase amount by City_Category per transaction($)", xlab = "City_Category", ylim = c(0, 1.2*max(avg_City_Category_spending_per_transaction$Average, na.rm = TRUE)), col = "dodgerblue",names.arg  = avg_City_Category_spending_per_transaction$City_Category)
+
+space_val = 0
+text(x = -0.4 + 1:length(avg_City_Category_spending_per_transaction$City_Category) * (1+space_val), y = avg_City_Category_spending_per_transaction$Average, labels = round(avg_City_Category_spending_per_transaction$Average,2), pos = 3) 
+```
+
+**Interesting fact 7**: One inference we can make from these charts is that customers from City B are simply making more purchases than residence of City A + City C, and not necessarily buying more expensive products. It is safe to make that claim due to the fact that the City B has the most Purcahse_Count by far different from the others, but its purchasing power and Amount_per Transaction is similar to that of City A and even lower than City C.
+
+Now, let's examine the distribution of our best selling product within each City_Category.
+
+```{r Top_Item by City_Category per transaction}
+data[data$Product_ID %in% top_5$Product_ID,] %>%
+  select(User_ID, Product_ID, City_Category, Purchase) %>%
+  group_by(Product_ID, City_Category) %>%
+  summarize(Total_purchase = sum(as.numeric(Purchase)),
+            Count = n()) %>%
+  mutate(Average = Total_purchase/Count)
+```
+
+**Interesting fact 8**: like what we have discussed before, even though people are purchasing the same product, they are paying different prices. Clearly, people in City A are paying less than those from the other two cities for most Top5 items. This could be explained by varied prices in different aging considering different living cost level. 
+
+Below two charts depicting the distribution of city categories within our "best seller" category as well as for all the items will show us if there is a specific city category that purchased the best selling product more than other shoppers..
+
+```{r City_Category population in Top_item VS City_Category population in Overall Items}
+City_Category_transaction_Top_item = data[data$Product_ID %in% top_5$Product_ID,] %>%
+  select(User_ID, City_Category) %>%
+  group_by(City_Category) %>%
+  summarize(Count = n())
+
+# Visualize the City_Category transaction for top items only
+pie(City_Category_transaction_Top_item$Count, labels = paste(paste(City_Category_transaction_Top_item$City_Category,round(City_Category_transaction_Top_item$Count/sum(City_Category_transaction_Top_item$Count)*100,2)),"%",sep = ""), main="% of transactions in each City_Category for top items only")
+
+# Visualize the overall City_Category transaction
+City_Category_transaction = data %>%
+  select(User_ID, City_Category) %>%
+  group_by(City_Category) %>%
+  summarize(Count = n())
+
+pie(City_Category_transaction$Count, labels = paste(paste(City_Category_transaction$City_Category,round(City_Category_transaction$Count/sum(City_Category_transaction$Count)*100,2)),"%",sep = ""), main="% of transactions in each City_Category for all items")
+```
+
+**Interesting fact 9**: It seems that these top products are loved by people from city C. Also compared with the overall distribution pie chat, people from city C purchased the best selling product more than other shoppers.
+
+###OCCUPATION
+
+Next, let's examine if people doing different kinds of jobs would have different purchasing behaviour, focusing on if people from specific occupations would spend more.
+
+**The total spending of each person**
+
+```{r Occupation Spending per person}
+Occupation_data = data %>%
+  select(User_ID, Occupation) %>%
+  group_by(Occupation) %>%
+  distinct() %>%
+  summarize(Count = n())
+avg_Occupation_spending_per_person = data %>%
+  select(User_ID, Occupation, Purchase) %>%
+  group_by(Occupation) %>%
+  summarize(Total_purchase = sum(as.numeric(Purchase))) %>%
+  full_join(Occupation_data, by = "Occupation") %>%
+  group_by(Occupation) %>%
+  summarize(Average = Total_purchase/Count)
+
+# Visualize the avg_Occupation_spending_per_person
+barplot(height = avg_Occupation_spending_per_person$Average, space=0.01, las = 1, main = "Average purchase amount by age per person($)", xlab = "Occupation", ylim = c(0, 1.2*max(avg_Occupation_spending_per_person$Average, na.rm = TRUE)), col = "dodgerblue", names.arg  = avg_Occupation_spending_per_person$Occupation)
+
+space_val = 0
+text(x = -0.4 + 1:length(avg_Occupation_spending_per_person$Occupation) * (1+space_val), y = avg_Occupation_spending_per_person$Average, labels = round(avg_Occupation_spending_per_person$Average,2), pos = 3) 
+```
+
+It can be seen that the occupational category has a lot to do with the amount of consumption. This specific store can provide products that are more in line with professional characteristics according to the top ranked occupations.
+
+###Stay_In_Current_City_Years
+
+```{r visualized_Stay_In_Current_City_Years}
+Stay_In_Current_City_Years_data = data %>%
+  select(User_ID, Stay_In_Current_City_Years) %>%
+  group_by(Stay_In_Current_City_Years) %>%
+  distinct() %>%
+  summarize(Count = n())
+# Visualize the City_Category population
+barplot(height = Stay_In_Current_City_Years_data$Count, space=0.01, las = 1, main = "Stay_In_Current_City_Years population of Black Friday customers", ylab = "number of customers", xlab = "Stay_In_Current_City_Years", ylim = c(0, 1.2*max(Stay_In_Current_City_Years_data$Count, na.rm = TRUE)), col = "dodgerblue", names.arg = Stay_In_Current_City_Years_data$Stay_In_Current_City_Years)
+
+space_val = 0
+text(x = -0.4 + 1:length(Stay_In_Current_City_Years_data$Stay_In_Current_City_Years) * (1+space_val), y = Stay_In_Current_City_Years_data$Count, labels = Stay_In_Current_City_Years_data$Count, pos = 3)             
+```
+
+**Interesting fact 10**: People who live for a year consume the most, and then decrement, which makes sense in real life. When you first come to the city, you need to buy all kinds of daily necessities.
+
+#Part3: Cluster Analysis -- kmeans
+
+We will provide insight to the black friday sales using clustering with k-means algorithm to inspect the characteristics of each cluster based on (1) needs-based variables, and (2) demographics. 
+
+  - Profiling clusters by needs-based variables will help us understand how the market segments differ in their needs which in turn will aid the firm in offering products and services to matches the unique needs of the segment. 
+  - Profiling clusters on demographics or observable variables will help identify customers and target them with the right offer.
+
+In this case, since we do not have much information about products, we will only use demographics to indentify target customers.
+
+**Demographic-based**
+
+**pre-process**: In order to use cluster analysis, let pre-process the data. Since all the variables to do with demographic analysis are character, we need to dummy them in the first step and then scale them.
+
+```{r pre_cluster_analysis}
+#Make the categorical dummy variable using dummyVars function in caret
+dummy <- dummyVars("~ Gender + Age + Occupation + City_Category + Stay_In_Current_City_Years + Marital_Status", data = data)
+new_df <- data.frame(predict(dummy, newdata = data))
+
+#Merge the two datasets together
+new_data <- cbind(data, new_df)
+
+#Select variables that will be used in later clustering:
+cluster_data <- new_data %>% select(-User_ID, -Product_ID, -Gender, -Age, -City_Category, -Occupation, -Stay_In_Current_City_Years, -Marital_Status, -Product_Category_1, -Product_Category_2, -Product_Category_3, -Purchase)
+
+#Scale the data
+cluster_data <- scale(cluster_data)
+```
+
+```{r kmeans_demographic_based}
+tot_withinss <- map_dbl(1:10,  function(k){
+  model <- kmeans(x = cluster_data, centers = k)
+  model$tot.withinss
+})
+
+elbow_df <- data.frame(
+  k = 1:10,
+  tot_withinss = tot_withinss
+)
+
+ggplot(elbow_df, aes(x = k, y = tot_withinss)) +
+  geom_line() +
+  scale_x_continuous(breaks = 1:10)
+```
+
+Unfortunately, this work did not yield great results, as the elbow plot generated by our model did not show any “elbow” where the slope of the line flattens out.  Instead, the graph presents a relatively straight shape for the first eight values and is difficult to interpret. Here, we will go with a four-cluster solution.
+
+```{r kmeans_model_demographic_based}
+#build a kmeans model
+model_km4 <- kmeans(cluster_data, centers = 4)
+#extract the cluster
+clust_km4 <- model_km4$cluster
+black_friday_km4 <- mutate(as.data.frame(cluster_data), cluster = clust_km4)
+head(black_friday_km4)
+#count the number of customer in each cluster:
+count(black_friday_km4, cluster)
+#mutate the result back into the original data set
+blackfriday_demographic_based <- data %>% 
+                  mutate(cluster = clust_km4)
+head(blackfriday_demographic_based)
+```
+
+**Summarize the result**: 
+
+1. calculate the mean purchase of each group.
+
+```{r kmeans_summary_demographic_based}
+blackfriday_demographic_based %>% 
+  group_by(cluster) %>% 
+  summarise(mean_purchase = mean(Purchase))
+```
+
+When we take more variables into consideration, the results can be used to target customer segments and develop marketing campaign. Despite our efforts, none of these clusters had significantly different purchasing habits than the overall populations, which prohibited us from making any actionable insights based on the results that could increase sales.
+
+2. Use k-means segments to examine means of each demographic-based variable. 
+
+```{r kmeans_segments_demographic_based_Gender}
+data2 <- cbind(data,clust_km4)
+library(ggplot2)
+library(RColorBrewer) 
+tab1 = prop.table(table(data2$clust_km4,data2[,3]),1)
+tab1 = data.frame(round(tab1,2))
+ggplot(data=tab1,aes(x=Var2,y=Var1,fill=Freq))+
+   geom_tile()+
+   geom_text(aes(label=Freq),size=6)+
+   xlab(label = '')+
+   ylab(label = '')+
+   scale_fill_gradientn(colors=brewer.pal(n=9,name = 'Greens'))
+tab2 = prop.table(table(data2$clust_km4,data2[,4]),1)
+tab2 = data.frame(round(tab2,2))
+ggplot(data=tab2,aes(x=Var2,y=Var1,fill=Freq))+
+   geom_tile()+
+   geom_text(aes(label=Freq),size=6)+
+   xlab(label = '')+
+   ylab(label = '')+
+   scale_fill_gradientn(colors=brewer.pal(n=9,name = 'Greens'))
+tab3 = prop.table(table(data2$clust_km4,data2[,6]),1)
+tab3 = data.frame(round(tab3,2))
+ggplot(data=tab3,aes(x=Var2,y=Var1,fill=Freq))+
+   geom_tile()+
+   geom_text(aes(label=Freq),size=6)+
+   xlab(label = '')+
+   ylab(label = '')+
+   scale_fill_gradientn(colors=brewer.pal(n=9,name = 'Greens'))
+```
+
+Based on these results, we can find that most of people in the first cluster are males and aging from 26 to 35. With these information, we can target our customer to increase the sale. 
+
+Normally, profiling clusters on demographics or observable variables will help identify customers and target them with the right offer. But in this case, kmeans result is really disappointing.
+
+#Part4: Recommender system
+
+### Brief data exploration 2 for our recommender system
+
+There are 5891 users, 3623 products, 18 Product_Category_1 items, 18 Product_Category_2 items, and 16 Product_Category_3 items. We would have a very large, sparse user-product matrix (i.e. 5891-by-3623 matrix) for our recommender system. The sparsity was estimated to be just around 2% (not shown here).
+
+On the other hand, 'Product_Category_1' has no NA values, meaning that any specific product necessarily belongs to one of Product_Category_1 items. However, both 'Product_Category_2' and 'Product_Category_3' variables have many NA values, meaning that some products are not classified into either of the two categories. 
+
+Therefore, Product_Category_1 variable was chosen for the simplicity of our analysis. We have 5891-by-18 user-Product_Category_1 matrix for analysis, and users are going to get recommendations based on product categories. 
+
+```{r Brief data exploration 2}
+length(unique(data$User_ID))
+length(unique(data$Product_ID))
+length(unique(data$Product_Category_1))
+length(unique(data$Product_Category_2))
+length(unique(data$Product_Category_3))
+
+sum(is.na(data$Product_Category_1))
+sum(is.na(data$Product_Category_2))
+sum(is.na(data$Product_Category_3))
+```
+
+### Select varaibles for recommender system
+
+First, User_ID and Product_Category_1 variables are picked, and a new column, called 'Rating_1', with all values having 1 is added. Here, the fact that a user purchased a product is counted as one rating. 
+
+```{r Select varaibles}
+data_recom = cbind(data['User_ID'], data['Product_Category_1'], 1)
+colnames(data_recom) = c('User_ID', 'Product_Category_1', 'Rating_1') # rename column names
+head(data_recom)
+
+```
+
+### Convert the dataset into the realRatingMatrix form
+
+The three selected variables are converted into the realRatingMatrix form, resulting in 5891-by-18 user-Product_Category_1 matrix. During the conversion process, Rating_1 variables with the same user and the same product are summed up. As a result, for example, we can see in the user-Product_Category_1 matrix that user ID #1000001 bought 11 products that belong to the Product_Category_1 item #3. Also, we can see that user ID #1000001 didn't bought any product that belongs to the Product_Category_1 item #7.
+
+```{r Convert into the realRatingMatrix form}
+data_matrix = as(data_recom, Class = 'realRatingMatrix')
+
+data_matrix
+dim(data_matrix) # Dimensions of this realRatingMatrix
+
+head(as(data_matrix,'matrix'))
+
+image(data_matrix[1:5,1:5]) # Implementation of image by recommenderlab generates a heatmap.
+```
+
+## Sparsity Check
+
+On a side note, the user-Product_Category_1 matrix contains a number of missing values. This is a sparse matrix with 49.38% elements rated.
+
+```{r Sparsity Check}
+nratings(data_matrix)/(ncol(data_matrix)*nrow(data_matrix)) 
+```
+
+## Exploring Data
+
+The first plot shows the number of users who bought products that belong to each of Product_Category_1 items. Products that belong to Product_Category_1 item #1, #5, and #8 are most purchased, while products that belong to Product_Category_1 item #9 and #17 are least purchased. 
+The second plot shows the number of users who bought products that belong to a specific number of Product_Category_1 items. The number of users who bought products, each of which belongs to one of six Product_Category_1 items, is the highest. 
+
+```{r Exploring Data}
+data.frame(no_of_ratings=colCounts(data_matrix))%>%
+  rownames_to_column()%>%
+  ggplot(aes(x=as.numeric(gsub(rowname,pattern = '[a-z]',replacement = '')), y=no_of_ratings))+
+  geom_col(fill='seagreen3')+xlab('Product_Category_1 (id)')+ylab('Number of users who purchased') + theme_bw()
+
+ggplot(data=data.frame(no_of_jokes_rated = rowCounts(data_matrix)),aes(x=no_of_jokes_rated))+
+  geom_histogram(bins=50,fill='seagreen3')+ylab('Number of users')+xlab('Number of Product_Category_1 purchased per user')
+
+```
+
+## Comparison of before and after normalizations
+
+Every user has his or her own income and spending plan. Therefore, the total number of purchases or the average number of purchases are different for each user. The first plot shows this distribution. The data should be normalized for each user for recommender system analysis. The second plot shows the distribution after normalization, proving that every user's average number of purchases is centered to zero.  
+
+```{r before and after normalizations}
+# before normalization
+ggplot(data=data.frame(mean_number_of_purchases = rowMeans(data_matrix)),aes(x=mean_number_of_purchases))+
+  geom_histogram(fill='seagreen3')
+
+# after normalization
+ggplot(data=data.frame(mean_number_of_purchases = rowMeans(normalize(data_matrix))),aes(x=mean_number_of_purchases))+
+  geom_histogram(fill='seagreen3')
+
+```
+
+### Similarity matrix
+
+Cosine similarity is examined for some five users. User Id #1000005 and #1000009 show the highest similarity in this case. Both users most purchased products that belong to Product_Category_1 item #1, #5, and #8.
+
+(cf. Recommenderlab functions perform normalizing and compute similarity measures within the Recommender function, so in practice there is no need to perform these functions earlier.)
+
+```{r Similarity matrix}
+similarity(normalize(data_matrix)[c(1,3,5,7,9)],method = 'cosine')
+# similarity(normalize(data_matrix)[c(1,3,5,7,9)],method = 'pearson')
+# similarity(normalize(data_matrix)[c(1,3,5,7,9)],method = 'euclidean')
+
+as(data_matrix,'matrix')[c(5,9),]
+
+```
+
+### Exploration of functions and their default parameters
+
+```{r Exploration of functions}
+names(recommenderRegistry$get_entries(dataType='realRatingMatrix'))
+recommenderRegistry$get_entries(data='realRatingMatrix')$UBCF_realRatingMatrix
+recommenderRegistry$get_entries(data='realRatingMatrix')$IBCF_realRatingMatrix
+```
+
+### Setting for recommender algorithms
+
+```{r Setting for recommender algorithms}
+set.seed(1031)
+# es = evaluationScheme(data_matrix, method='cross-validation', k=10, given=4)
+# es = evaluationScheme(data_matrix, method='cross-validation', k=10, given=1)
+es = evaluationScheme(data_matrix, method='cross-validation', k=10, given=-1)
+```
+
+### Comparison of recommender algorithms
+
+Considered are 4 recommender algorithms: Random, Popular, User-based Collaborative Filtering (UBCF), and Item-based Collaborative Filtering (IBCF). For both UBCF and IBCF, optimized parameter sets were found. UBCF with an optimized parameter set (nn=400, method='euclidean') showed the lowest RMSE (i.e. 14.07137).
+
+```{r Comparison of recommender algorithms}
+recommender_algorithms = list(random = list(name='RANDOM'),
+                              popular = list(name='POPULAR'),
+                              ubcf = list(name='UBCF'),
+                              # ubcf_100 = list(name='UBCF', parameters=list(nn=100)),
+                              # ubcf_400 = list(name='UBCF', parameters=list(nn=400)),
+                              # ubcf_1600 = list(name='UBCF', parameters=list(nn=1600)),
+                              # ubcf_400_zsco = list(name='UBCF', parameters=list(nn=400, normalize='Z-score')),
+                              # ubcf_400_pear = list(name='UBCF', parameters=list(nn=400, method='pearson')),
+                              ubcf_400_eucl = list(name='UBCF', parameters=list(nn=400, method='euclidean')),
+                              ibcf = list(name='IBCF'),
+                              # ibcf_60 = list(name='IBCF', parameters=list(k=60)),
+                              # ibcf_120 = list(name='IBCF', parameters=list(k=120)),
+                              # ibcf_60_zsco = list(name='IBCF', parameters=list(k=60, normalize='Z-score')),
+                              # ibcf_60_pear = list(name='IBCF', parameters=list(k=60, method='pearson')),
+                              ibcf_60_eucl = list(name='IBCF', parameters=list(k=60, method='euclidean')))
+ev = evaluate(x = es,method=recommender_algorithms, type='ratings')
+
+results = matrix(unlist(avg(ev)), ncol=3, byrow = TRUE)
+colnames(results) = c('RMSE','MSE','MAE')
+rownames(results) = c('random','popular', 
+                      'ubcf','ubcf_400_eucl','ibcf','ibcf_60_eucl')
+                      # 'ubcf','ubcf_100','ubcf_400','ubcf_1600','ubcf_400_zsco','ubcf_400_pear','ubcf_400_eucl',
+                      # 'ibcf','ibcf_60','ibcf_120','ibcf_60_zsco','ibcf_60_pear','ibcf_60_eucl')
+results # ubcf_400_eucl 13.77110 191.2506  7.484053
+
+plot(ev)
+```
+
+### Top n recommendations
+
+Through the optimized UBCF algorithm, first 5 users are recommended 5 unpurchased product categories. For example, user id #1000001 is turned out to be most likely to purchase products that belong to Product_Category_1 item #9, #17, #18, #13, and #7 in order.
+
+```{r Top n recommendations}
+recom_ubcf = Recommender(data_matrix, method='UBCF', parameter=list(normalize='center', nn=400, method='euclidean'))
+
+pred_ubcf_topN = predict(recom_ubcf,newdata=data_matrix,method='topNList',n=5)
+getList(pred_ubcf_topN)[1:5]
+
+```
+
+### Ratings
+
+Also, their predicted purchase numbers for each unpurchased product categories were identified. For example, user id #1000001 is turned out to be most likely to purchase about 3 (~ 3.229710) products of Product_Category_1 item #7.
+
+In conclusion, we can give each user a customized recommendation and expect to make more profits.
+
+```{r Ratings}
+pred_ubcf = predict(recom_ubcf, newdata=data_matrix, type='ratings')
+
+as(data_matrix,'matrix')[1:5,]
+as(pred_ubcf,'matrix')[1:5,]
+```
+
+#Part5: Market Basket Analysis
+
+To manipulate the data into a format that works for a market basket analysis, we can use dplyr and create a new dataset. The methods we used in class were not working well with the data, so we adopted a data preparation method from Kaggle competitor Dean Agate's kernel on Kaggle.com. 
+
+Source: https://www.kaggle.com/dabate/black-friday-examined-eda-apriori
+
+```{r Basket Analysis1}
+bask <- data %>%
+  select(User_ID, Product_ID) %>%   # Selecting the columns we will need
+  group_by(User_ID) %>%             # Grouping by "User_ID"          
+  arrange(User_ID) %>%              # Arranging by "User_ID" 
+  mutate(id = row_number()) %>%     # Defining a key column for each "Product_ID" and its corresponding "User_ID" (Must do this for spread() to work properly)
+  spread(User_ID, Product_ID) %>%   # Converting our dataset from tall to wide format, and grouping "Product_IDs" to their corresponding "User_ID"
+  t()                               # Transpose dataset from columns of users to rows
+```
+
+Each row now contains all of the products that each user bought on Black Friday. User IDs are no longer needed for the analysis, so we drop them from the dataset.
+
+```{r Basket Analysis2}
+bask <- bask[-1,]
+```
+
+We now create a csv file with the manipulated basket data. This allows us to reprocess the data in a format that works for our analysis.
+
+```{r Basket Analysis3}
+write.csv(bask, file = 'bask.csv')
+```
+
+We now load the arules and arulesViz packages and use the read.transactions() function on the csv file we just created. This format allows us to visualize and create association rules on the data.
+
+```{r Basket Analysis4}
+library(arules); library(arulesViz)
+
+items <- read.transactions('bask.csv', sep = ',', rm.duplicates = TRUE) 
+```
+Let's check out the new data using dim() and summary()
+```{r Basket Analysis5}
+dim(items) # 5892 transactions,  10539 items
+summary(items)
+```
+
+Now that it appears our data is in the right format, we can start visualizing. Since there are so many transactions and possible rules, we will start by only looking at the top 20 using the topN argument in itemFrequencyPlot()
+
+```{r Basket Analysis6}
+itemFrequencyPlot(items, topN = 20,
+                  type = "relative", horiz = TRUE, col = "dark red", las = 1,
+                  xlab = paste("Proportion of Market Baskets Containing Item",
+                               "\n(Item Relative Frequency or Support)"))
+```
+We can see the max support level is over .30, four products have support levels over .25, and all products in the top 20 have a support level of at least .20.This is helpful for when we start to specify our parameters in each rule set.
+
+We can also use the crossTable() function to sort the items by their count and view them in a confusion matrix. We will only look at the top 5 products.
+
+```{r Basket Analysis7}
+crosstab <- crossTable(items, measure="count", sort=TRUE)
+crosstab[1:5,1:5]
+```
+
+Everything appears to be in order, so now it is time to create some association rules. We will start with a support parameter of 0.05 - this means that a minimum of 5% of the transactions will be necessary for inclusion in the set of rules.
+
+```{r Basket Analysis8}
+rules1 <- apriori(items, parameter = list(support = 0.05, confidence = 0.05))
+summary(rules1) # 3280 rules
+```
+
+Holy crap, that's a lot of rules! We need to cut this down. Since we saw from the item frequency plot that all of the top 20 products are over the 0.20 support level, let's change the support level to this value and see how it affects the rules.
+
+```{r Basket Analysis8_1}
+rules2 <- apriori(items,parameter = list(support = 0.2, confidence = 0.05))
+
+summary(rules2) # 25 rules
+```
+
+There are now 25 association rules - cool! This will be way more manageable for us to understand and visualize. We can use the RColorBrewer to look nice visualizations of our rule set.
+
+```{r Basket Analysis9}
+library(RColorBrewer)
+plot(rules2,
+     control=list(jitter=0, col = rev(brewer.pal(9, "Greens")[4:9])),
+     shading = "lift")
+```
+
+Uh oh, here we can see a red flag: the item frequency plot shows a perfectly direct relationship between support and confidence. In other words, the lift of all rules is 1. This means we are likely only observing one item at a time under these rules.
+
+Let's look at the top rules by support to confirm our insights.
+
+```{r Basket Analysis10}
+inspect(head(sort(rules2, by = "support")))
+```
+
+As suspected, the rules with the highest support level do not have any lhs variables listed. Let's see if we can fix this by adjusting the confidence parameter upwards to .75 and the support parameter downwards to .01. We specify the maxtime parameter as zero to let the model run as long as needed. (rules can take a while to model with a low support parameter)
+
+```{r Basket Analysis11}
+rules3 <- apriori(data = items,
+                  parameter = list(support = 0.01, confidence = 0.75, maxtime = 0)) 
+```
+
+Boom - only 5 rules are left after we increase the confidence and lower the support. Let's visualize these again using the same techniques as before.
+
+```{r Basket Analysis12}
+plot(rules3,
+     control=list(jitter=0, col = rev(brewer.pal(9, "Greens")[4:9])),
+     shading = "lift")
+```
+
+Great - no direct relationship between support and confidence. Let's double check the underlying data to be sure.
+
+```{r Basket Analysis13}
+inspect(head(sort(rules3, by = "support")))
+```
+
+Awesome - products are showing up in the lhs and rhs columns so we know that there are real association rules being used here. Now, it is time to plot the rules.
+
+```{r Basket Analysis14}
+plot(rules3, method = 'graph')
+```
+
+And there you have it - our association rules have been visualized. We can see which products correspond to each rule based on the arrows pointing from each product ID to the circles representing each rule. The two rules shown in the top left are colored lighter for their relatively low lift values, and the rule shown in the top right is tiny due to its relatively low support value. 
+
+It would be far more interesting if we could understand which products these codes represent. Without that information, we cannot fully understand the findings of our analysis or create actionable recommendations on it. 

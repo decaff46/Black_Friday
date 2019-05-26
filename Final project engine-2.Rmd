@@ -1,0 +1,312 @@
+---
+title: "Final_project engine"
+output: flexdashboard::flex_dashboard
+runtime: shiny
+---
+
+
+```{r setup, include=FALSE}
+library(flexdashboard)
+library(shiny)
+library(rmarkdown)
+library(knitr)
+library(Hmisc)
+library(DT)
+library(tidyverse)
+library(scales)
+library(arules)
+library(ggplot2)
+library(gridExtra)
+library(data.table)
+library(base)
+
+assignInNamespace("cedta.override", c(data.table:::cedta.override,"rmarkdown"), "data.table")
+
+
+opts_chunk$set(echo = FALSE, comment="", warning = FALSE, message = FALSE, tidy.opts=list(width.cutoff=55), tidy = TRUE)
+
+```
+
+
+```{r read_data, include=FALSE, eval = TRUE}
+dat = fread("../Data/BlackFriday.csv")
+```
+
+
+```{r constants}
+id.name <- "User_ID"
+product.name <- "Product_ID"
+gender.name <- "Gender"
+age.group.name <- "Age"
+occupation.name <- "Occupation"
+city.name <- "City_Category"
+stay.duration.name <- "Stay_In_Current_City_Years"
+marital.status.name <- "Marital_Status"
+purchase.name <- "Purchase"
+
+dat[,User_ID := as.factor(User_ID)]
+dat[,Product_ID := as.factor(Product_ID)]
+dat[,Gender := as.factor(Gender)]
+dat[,Age := as.factor(Age)]
+dat[,Occupation := as.factor(Occupation)]
+dat[,City_Category := as.factor(City_Category)]
+dat[,Stay_In_Current_City_Years := as.factor(Stay_In_Current_City_Years)]
+dat[,Marital_Status := as.factor(Marital_Status)]
+
+dat[is.na(dat)] = 0
+
+pattern.pc <- "Product_Category_"
+pc.list <- names(dat)[grep(pattern = pattern.pc, x = names(dat))]
+
+unique.genders <- dat[, unique(get(gender.name))]
+unique.age.groups <- dat[, unique(get(age.group.name))]
+unique.occupation <- dat[, unique(get(occupation.name))]
+unique.city <- dat[, unique(get(city.name))]
+unique.stay.duration.name <- dat[, unique(get(stay.duration.name))]
+unique.purchase.name <- dat[, unique(get(purchase.name))]
+
+unique.products <- dat[, unique(get(product.name))]
+num.products <- length(unique.products)
+
+respondent.variables <- c(gender.name, age.group.name,occupation.name,city.name,stay.duration.name,marital.status.name)
+dependent.variables <- c(pc.list, purchase.name)
+```
+
+```{r functions}
+percentage.table <- function(x, digits = 1){
+  tab <- table(x)
+  percentage.tab <- 100*tab/(sum(tab))
+  rounded.tab <- round(x = percentage.tab, digits = digits)
+  return(rounded.tab)
+}
+
+round.numerics <- function(x, digits){
+  if(is.numeric(x)){
+    x <- round(x = x, digits = digits)
+  }
+  return(x)
+}
+
+```
+
+
+Introduction
+=====================================  
+
+We are analyzing a sample of the transactions made in a retail store on a Black Friday.  
+
+The survey was given to `r dat[, length(unique(get(id.name)))]` respondents and covered `r num.products` separate products.
+
+Click on the tabs to see different reports.
+
+
+Part 1
+===================================
+
+**Descriptive analysis about consumers**
+
+First, take a look at who our consumers are based on their gender, age, occupation, city, time stayed in current city, and marital status
+
+Row {data-height=500}
+-------------------------------------
+
+```{r consumers}
+inputPanel(
+  selectInput(inputId="p1_respondent_variable", label = "Select Variable:", choices = respondent.variables, selected = respondent.variables[1]),
+  checkboxInput(inputId = "p1_respondent_show_percentages", label = "Show Percentages", value = TRUE)
+)
+
+renderPlot({
+  sub <- unique(dat[,.(get(id.name),get(input$p1_respondent_variable))])
+  setnames(sub, old = c("V1", "V2"), new = c(eval(id.name), eval(input$p1_respondent_variable)))
+  tab <- percentage.table(x = sub[,get(input$p1_respondent_variable)])
+  barplot(height = tab, space=0.01, las = 1, main = paste(input$p1_respondent_variable, "population of Black Friday customers"), ylab = "Percentage of customers", xlab = input$p1_respondent_variable, ylim = c(0, 1.2*max(tab, na.rm = TRUE)), col = "dodgerblue") + 
+  scale_x_discrete(limits=levels(dat[,get(input$p1_respondent_variable)]))
+  
+  if(input$p1_respondent_show_percentages == TRUE){
+    space_val = 0
+    text(x = -0.4 + 1:length(tab) * (1+space_val), y = tab, labels = sprintf("%.1f%%", tab), pos = 3)
+  }
+})
+```
+
+Part 2
+=====================================  
+
+**Who is making more transactions?**
+
+We would like to know what kind of consumers is making transactions the most?
+
+Row {data-height=800}
+-------------------------------------
+
+```{r transactions}
+inputPanel(
+  selectInput(inputId="p2_respondent_variable", label = "Select Variable:", choices = respondent.variables, selected = respondent.variables[1]),
+  checkboxInput(inputId = "p2_respondent_show_percentages", label = "Show Percentages", value = TRUE)
+)
+
+renderPlot({
+  tab <- percentage.table(x = dat[, get(input$p2_respondent_variable)])
+  barplot(height = tab, space=0.01, las = 1, main = paste(input$p2_respondent_variable, "population of Black Friday transactions"), ylab = "Percentage of transactions", xlab = input$p2_respondent_variable, ylim = c(0, 1.2*max(tab, na.rm = TRUE)), col = "dodgerblue") + 
+  scale_x_discrete(limits=levels(dat[,get(input$p2_respondent_variable)]))
+  
+  if(input$p1_respondent_show_percentages == TRUE){
+    space_val = 0
+    text(x = -0.4 + 1:length(tab) * (1+space_val), y = tab, labels = sprintf("%.1f%%", tab), pos = 3)
+  }
+})
+```
+
+Part 3
+=====================================  
+
+**Who is generating more sales in total?**
+
+By analyzing sales generated from different groups, we would like to know what kind of consumers is buying the most in total. Just to be clear, here our calculation is based on ***total spending of each person*** instead of each transaction. 
+
+Row {data-height=800}
+-------------------------------------
+
+```{r sales_consumer}
+inputPanel(
+  selectInput(inputId="p3_respondent_variable", label = "Select Variable:", choices = respondent.variables, selected = respondent.variables[1])
+)
+
+renderPlot({
+  list = unique(dat[,.(get(input$p3_respondent_variable)), by = eval(id.name)])
+  setnames(list, old = c("V1"), new = c(eval(input$p3_respondent_variable)))
+  
+  total.purchase = dat[,.(total.purchase = sum(get(purchase.name))),by = eval(id.name)]
+  
+  sub = merge(list,total.purchase,by = eval(id.name))
+  
+  tab = setorderv(sub[,.(Mean = mean(total.purchase, na.rm = TRUE)), by = eval(input$p3_respondent_variable)], eval(input$p3_respondent_variable))
+  
+  barplot(height = tab[,Mean], space=0.01, las = 1, main = sprintf("Total spending of each person among different %s", input$p3_respondent_variable), ylim = c(0, 1.2*max(tab[,Mean], na.rm = TRUE)), col = "dodgerblue", names.arg = tab[, get(input$p3_respondent_variable)],xlab = input$p3_respondent_variable) + 
+  scale_x_discrete(limits=levels(dat[,get(input$p3_respondent_variable)]))
+  
+  space_val = 0
+  text(x = -0.4 + 1:tab[,.N] * (1+space_val), y = tab[,Mean], labels = tab[, round(Mean,0)], pos = 3)
+})
+```
+
+Part 4
+=====================================  
+
+**Who is spending more in each transaction?**
+
+By further analyzing sales generated from different groups, we would like to know what kind of consumers is buying the most in each transaction. Just to be clear, here our calculation is based on ***each transaction*** instead of total spending of each person. 
+
+Row {data-height=800}
+-------------------------------------
+
+```{r sales_transaction}
+inputPanel(
+  selectInput(inputId="p4_respondent_variable", label = "Select Variable:", choices = respondent.variables, selected = respondent.variables[1])
+)
+
+renderPlot({
+  tab = setorderv(dat[,.(Mean = mean(get(purchase.name), na.rm = TRUE)), by = eval(input$p4_respondent_variable)], eval(input$p4_respondent_variable))
+  
+  barplot(height = tab[,Mean], space=0.01, las = 1, main = sprintf("Total spending of each transaction among different %s", input$p4_respondent_variable), ylim = c(0, 1.2*max(tab[,Mean], na.rm = TRUE)), col = "dodgerblue", names.arg = tab[, get(input$p4_respondent_variable)],xlab = input$p4_respondent_variable) + 
+  scale_x_discrete(limits=levels(dat[,get(input$p4_respondent_variable)]))
+  
+  space_val = 0
+  text(x = -0.4 + 1:tab[,.N] * (1+space_val), y = tab[,Mean], labels = tab[, round(Mean,0)], pos = 3)
+})
+```
+
+Part 5
+=====================================  
+
+**Who is spending more? Let's take more variables into account**
+
+By analyzing sales generated from different groups deeper, we would like to know what kind of consumers is buying the most either in total or in each transaction with more than one variable taken into account.
+
+Row {data-height=800}
+-------------------------------------
+
+```{r sales_customer_transaction}
+base.list <- c("total spending of each person","total spending of each transaction")
+
+inputPanel(
+  selectInput(inputId="p5_1_respondent_variable", label = "Select Variable1:", choices = respondent.variables, selected = respondent.variables[1]),
+  selectInput(inputId="p5_2_respondent_variable", label = "Select Variable2:", choices = respondent.variables, selected = respondent.variables[2]),
+  selectInput(inputId="p5_3_respondent_variable", label = "Select analysis base:", choices = base.list, selected = base.list[1])
+)
+
+renderPlot({
+  if (input$p5_3_respondent_variable == base.list[1]){
+  list = unique(dat[,.(get(input$p5_1_respondent_variable),get(input$p5_2_respondent_variable)), by = eval(id.name)])
+  setnames(list, old = c("V1","V2"), new = c(eval(input$p5_1_respondent_variable),eval(input$p5_2_respondent_variable)))
+  
+  total.purchase = dat[,.(total.purchase = sum(get(purchase.name))),by = eval(id.name)]
+  
+  sub = merge(list,total.purchase,by = eval(id.name))
+  
+  tab = sub[,.(Mean = mean(total.purchase, na.rm = TRUE)), by = c(eval(input$p5_1_respondent_variable),eval(input$p5_2_respondent_variable))]
+  
+  ggplot(tab, aes(x = get(input$p5_1_respondent_variable), y = Mean, fill = get(input$p5_2_respondent_variable))) +
+  geom_bar(stat = 'identity',position = 'dodge') +
+  scale_color_brewer(palette = "Spectral") +
+  xlab(eval(input$p5_1_respondent_variable)) +
+  ylab("Total spending of each person") +
+  ggtitle(sprintf("Total spending of each person among different %s and %s", input$p5_1_respondent_variable, input$p5_1_respondent_variable)) +
+  theme(plot.title = element_text(size=9.5)) + 
+  labs(fill=eval(input$p5_2_respondent_variable)) + 
+  scale_fill_brewer(palette= 9)
+  } else{
+    
+  tab = dat[,.(Mean = mean(get(purchase.name), na.rm = TRUE)), by = c(eval(input$p5_1_respondent_variable),eval(input$p5_2_respondent_variable))] 
+  
+  ggplot(tab, aes(x = get(input$p5_1_respondent_variable), y = Mean, fill = get(input$p5_2_respondent_variable))) +
+  geom_bar(stat = 'identity',position = 'dodge') +
+  scale_color_brewer(palette = "Spectral") +
+  xlab(eval(input$p5_1_respondent_variable)) +
+  ylab("Total spending of each transaction") +
+  ggtitle(sprintf("Total spending of each transaction among different %s and %s", input$p5_1_respondent_variable, input$p5_1_respondent_variable)) +
+  theme(plot.title = element_text(size=9.5)) + 
+  labs(fill=eval(input$p5_2_respondent_variable)) + 
+  scale_fill_brewer(palette= 9)
+  }
+
+})
+```
+
+Part 6
+=====================================  
+
+**Does our best seller cater to a specific gourp?**
+
+What we what to see here is whether within the overall observation set, both purchasers of the best seller and purchasers of all products are the same. By taking a look at the difference of transaction times, we can generally conclude whether our best seller caters to a specific group.
+
+Row {data-height=800}
+-------------------------------------
+
+```{r Top_items}
+inputPanel(
+  selectInput(inputId="p6_respondent_variable", label = "Select Variable:", choices = respondent.variables, selected = respondent.variables[1]),
+  sliderInput(inputId = "p6_top_items", label = "Select the number of top items:", min = 1, max = 20, value = 5, step = 1)
+)
+
+renderPlot({
+  top_item = dat %>%
+    count(Product_ID, sort = T)
+
+  top_n_ID = top_item[1:input$p6_top_items,]
+  
+  transaction_item = setorderv(dat[, .(Count = .N), by = eval(input$p6_respondent_variable)],eval(input$p6_respondent_variable))
+  transaction_Top_item = setorderv(dat[get(product.name) %in% top_n_ID$Product_ID, .(Count = .N), by = eval(input$p6_respondent_variable)],eval(input$p6_respondent_variable))
+ 
+# Put two pies all together
+  par(mfrow=c(1,2))
+
+# Visualize the Gender transaction for top items only
+  pie(transaction_Top_item$Count, labels = paste(paste(transaction_Top_item[,get(input$p6_respondent_variable)],round(transaction_Top_item$Count/sum(transaction_Top_item$Count)*100,2)),"%",sep = ""), main="% of transactions in each gender for top items only")
+
+# Visualize the overall Gender transaction
+  pie(transaction_item$Count, labels = paste(paste(transaction_item[,get(input$p6_respondent_variable)],round(transaction_item$Count/sum(transaction_item$Count)*100,2)),"%",sep = ""), main="% of transactions in each gender for all items")
+
+})
+```
